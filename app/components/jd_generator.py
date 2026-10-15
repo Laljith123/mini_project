@@ -197,9 +197,14 @@ def render_jd_generator():
             st.error("Please enter a valid Job Title.")
             return
 
+        api_key = AppStateManager.get_api_key()
+        if not api_key:
+            st.error("Client Gemini API key is not configured. Please enter your Gemini API key in the sidebar or under Settings.")
+            return
+
         with st.spinner("Synthesizing comprehensive Job Description via Google GenAI..."):
             try:
-                engine = JobDescriptionGenerator()
+                engine = JobDescriptionGenerator(api_key=api_key)
                 req_skills_list = [s.strip() for s in required_skills.split(",") if s.strip()]
                 pref_skills_list = [s.strip() for s in preferred_skills.split(",") if s.strip()]
 

@@ -82,3 +82,17 @@ data/raw/kaggle/jobs/*.csv
 data/raw/kaggle/resumes/*.csv
 data/raw/kaggle/linkedin/*.csv
 
+# Project reports & docx
+*.docx
+*.doc
+template_dump.txt
+existing_dump.txt
+template_media/
+existing_media/
+report_screenshots/
+report_diagrams/
+*.png
+# IDE & tooling artifacts
+.opencode/
+
+

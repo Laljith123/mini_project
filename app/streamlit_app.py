@@ -89,10 +89,139 @@ if st.session_state.get("_dataset_health_issues"):
             if health.get("commands"):
                 st.code("\n".join(health["commands"]), language="bash")
 
-if "active_view" not in st.session_state and "view" in st.query_params:
+if "view" in st.query_params:
     q_view = st.query_params.get("view")
-    if q_view:
+    if q_view and q_view != st.session_state.get("active_view"):
         AppStateManager.set_active_view(q_view)
+
+# Client-side API key configuration via query params
+client_key_param = st.query_params.get("api_key") or st.query_params.get("gemini_api_key")
+if client_key_param:
+    client_key_param = client_key_param.strip()
+    if client_key_param and client_key_param != st.session_state.get("custom_api_key"):
+        st.session_state.custom_api_key = client_key_param
+
+if st.query_params.get("demo_seed") == "1" and not st.session_state.get("_demo_seeded"):
+    try:
+        from src.models.schemas import (
+            ResumeProfile, ExperienceItem, EducationItem, ProjectItem,
+            JobMatchResult, JobPosting, CVSuggestionResult, BulletCritique, GeneratedJobDescription
+        )
+        from src.human_loop.review import ProfileReviewManager
+        from src.search.job_search import JobSearchEngine
+        from src.models.enums import WorkflowState, ReviewStatus
+
+        sample_prof = ResumeProfile(
+            name="Laljith V",
+            email="laljith.v@smvec.ac.in",
+            target_role="AI & Machine Learning Engineer",
+            skills=["Python", "PyTorch", "TensorFlow", "FastAPI", "Docker", "FAISS", "LangChain", "Generative AI", "Cloud Computing", "SQL"],
+            years_of_experience=3.5,
+            summary="High-performance AI engineer specializing in Retrieval-Augmented Generation (RAG), dense vector similarity search, and automated enterprise workflows.",
+            experience=[
+                ExperienceItem(role="Generative AI Engineer Intern", company="Wipro Center of Excellence (COE)", start_date="2025", end_date="Present", description="Architected dense vector search with FAISS achieving sub-50ms query latency across enterprise job corpus. Integrated Gemini 3.8 Flash for truth-preserving CV tailoring.", technologies=["Python", "FAISS", "Gemini API", "FastAPI"]),
+                ExperienceItem(role="Machine Learning Developer", company="AI Innovation Labs", start_date="2024", end_date="2025", description="Built end-to-end document extraction pipelines using PyPDF and Pydantic schemas. Implemented strict safety guardrails preventing prompt injection.", technologies=["Python", "Docker", "Pydantic", "PyTorch"])
+            ],
+            education=[
+                EducationItem(institution="Sri Manakula Vinayagar Engineering College", degree="B.Tech", field="Computer Science and Business Systems", start_date="2023", end_date="2027")
+            ],
+            projects=[
+                ProjectItem(name="AI-Powered Resume & Job Description Generator", description="Enterprise Generative AI platform for ATS-optimized resume customization, enterprise JD authoring, and FAISS semantic matching.", technologies=["Streamlit", "Gemini 3.8 Flash", "FAISS", "Python"])
+            ]
+        )
+        container = ProfileReviewManager.initialize_review(sample_prof)
+        ProfileReviewManager.apply_human_approval(container, sample_prof)
+        st.session_state.human_profile_container = container
+        st.session_state.workflow_state = WorkflowState.PROFILE_APPROVED
+        st.session_state.uploaded_file_name = "Laljith_V_Resume.pdf"
+        st.session_state.extracted_resume_text = "Laljith V - AI & Machine Learning Engineer\nSri Manakula Vinayagar Engineering College\nSkills: Python, PyTorch, FAISS, Docker, LangChain, FastAPI..."
+
+        try:
+            matches = JobSearchEngine().search_matching_jobs(container, top_k=5)
+            st.session_state.job_matches = matches
+            if matches:
+                st.session_state.selected_job_for_cv = matches[0]
+        except Exception:
+            pass
+
+        st.session_state.cv_suggestions = CVSuggestionResult(
+            target_job_id="naukri_1042",
+            target_job_title="Senior Machine Learning Engineer",
+            target_company="Enterprise AI Solutions",
+            missing_skills=["MLOps Pipeline Optimization", "Kubernetes", "BGE-Reranker"],
+            weak_bullets=[
+                BulletCritique(
+                    original_bullet="Worked on machine learning models and data preprocessing pipelines.",
+                    weakness_reason="Lacks quantified business outcomes and active situation-task-action-result (STAR) structure.",
+                    suggested_rewrite="Engineered automated data preprocessing pipelines in Python and Docker, accelerating model training throughput by 38% and reducing inference latency to <45ms."
+                ),
+                BulletCritique(
+                    original_bullet="Built vector search system using FAISS.",
+                    weakness_reason="Missing architectural context and performance metrics required by senior hiring panels.",
+                    suggested_rewrite="Architected a 3072-dimensional FAISS IndexFlatIP vector retrieval engine over 2,400+ job profiles, achieving 94.6% top-k retrieval precision."
+                )
+            ],
+            actionable_suggestions=[
+                "Highlight hands-on experience with production vector stores and embedding normalization in the header summary.",
+                "Emphasize experience collaborating with multi-functional teams during the Wipro COE internship.",
+                "Incorporate explicit MLOps continuous integration metrics to align with target senior role requirements."
+            ],
+            rewritten_summary="Results-driven Generative AI Engineer with proven expertise in dense vector search (FAISS), Large Language Model orchestration (Google Gemini 3.8 Flash), and Retrieval-Augmented Generation (RAG). Successfully architected low-latency candidate-job matching pipelines and truth-preserving CV generation systems.",
+            rewritten_bullets=[
+                "Architected 3072-dim FAISS IndexFlatIP retrieval engine, improving candidate-to-role match precision by 42%.",
+                "Engineered truth-preserving STAR resume tailoring system using Gemini 3.8 Flash with zero ungrounded hallucinations.",
+                "Deployed production Streamlit web interface with SQLite audit logging and multi-layer prompt injection guardrails."
+            ],
+            status=ReviewStatus.APPROVED
+        )
+
+        st.session_state.current_jd = GeneratedJobDescription(
+            title="Senior Machine Learning Engineer",
+            department="Artificial Intelligence & Cloud Systems",
+            experience_level="Senior (5+ Years)",
+            role_overview="We are seeking an experienced Senior Machine Learning Engineer to lead the design and deployment of enterprise Generative AI systems, dense vector retrieval pipelines, and scalable inference microservices. You will collaborate directly with cross-functional product and data engineering teams to deliver high-impact AI capabilities.",
+            key_responsibilities=[
+                "Lead the architecture and production scaling of Generative AI applications using Google Gemini API and FAISS vector databases.",
+                "Design and optimize high-throughput vector embedding retrieval pipelines with strict latency SLAs (<50ms).",
+                "Implement Human-in-the-Loop governance protocols, audit logging, and safety guardrails across all AI endpoints.",
+                "Mentor junior engineers and champion rigorous engineering practices, automated testing, and CI/CD pipelines."
+            ],
+            must_have_skills=[
+                "Python (Advanced)", "PyTorch / TensorFlow", "FAISS / Vector Databases",
+                "Large Language Models (LLMs) & RAG", "FastAPI & Microservices Architecture",
+                "Docker & Containerization"
+            ],
+            nice_to_have_skills=[
+                "Kubernetes Orchestration", "BGE-Reranker / Cross-Encoders",
+                "Cloud Native AI Deployments (GCP / AWS)", "Streamlit / UI Prototyping"
+            ],
+            experience_requirements="Bachelor's or Master's degree in Computer Science, Data Science, or related engineering discipline with 4-6+ years of production ML engineering experience.",
+            performance_metrics=[
+                "Retrieval precision and latency SLAs under production load",
+                "Zero compliance violations and 100% adherence to safety guardrails",
+                "System test coverage exceeding 90% across core engineering modules"
+            ],
+            evaluation_rubric=[
+                "System Architecture & Scaling: Evaluates understanding of vector indexing (IndexFlatIP), embedding dimensions, and distributed data pipelines.",
+                "Generative AI & RAG Depth: Evaluates prompt engineering, structured Pydantic schema validation, and hallucination prevention.",
+                "Production Engineering & Security: Evaluates API hygiene, secret management, Docker deployment, and multi-tier fallback resilience."
+            ],
+            compensation_and_benefits="Competitive salary package ($140,000 - $175,000) with performance bonus, comprehensive health insurance, remote work flexibility, and annual professional development stipend."
+        )
+
+        st.session_state.mentor_chat_history = [
+            {
+                "role": "user",
+                "content": "What skills and preparation should I focus on to become a Senior Machine Learning Engineer in Generative AI?"
+            },
+            {
+                "role": "assistant",
+                "content": "To advance into a Senior Machine Learning Engineer role specializing in Generative AI, you should focus on four core competency pillars based on the verified career roadmaps:\n\n1. **Dense Vector Search & Retrieval Architecture**: Master high-dimensional vector search algorithms (FAISS `IndexFlatIP`, HNSW), embedding normalization, and hybrid retrieval techniques combining dense semantic vectors with BM25 lexical ranking.\n\n2. **Production RAG & Structured LLM Pipelines**: Move beyond basic prompt engineering to structured output validation using Pydantic, multi-tier fallback models (e.g., Gemini 3.8 Flash to 3.6 Flash), and truth-preserving generation with strict citation verification.\n\n3. **MLOps & Deployment Resilience**: Develop deep proficiency in Docker containerization, asynchronous API serving (FastAPI), rate-limit handling with exponential backoff, and state-machine governance.\n\n4. **Security Engineering & Guardrails**: Implement multi-layer defense against prompt injection, jailbreaks, and sensitive credential leakage.\n\n*Sources Grounded: `data/career_notes/machine_learning_roadmap.txt` (Chunk 1, 3); `data/career_notes/interview_preparation_guide.txt` (Chunk 2)*"
+            }
+        ]
+        st.session_state._demo_seeded = True
+    except Exception as _e:
+        pass
 active_theme = AppStateManager.get_theme_mode()
 
 # Inject centralized styling tokens and layout rules (theme-aware)
@@ -144,6 +273,27 @@ with st.sidebar:
             if current_view != tool_key:
                 AppStateManager.set_active_view(tool_key)
                 st.rerun()
+
+    st.html('<div class="sh-nav-section-label">CLIENT API KEY</div>')
+    client_key_input = st.text_input(
+        "Gemini API Key",
+        type="password",
+        value=st.session_state.get("custom_api_key", ""),
+        placeholder="Paste your Gemini API key...",
+        help="Client-side Gemini API key used for resume tailoring, JD generation, and career mentoring. Stays strictly in your browser session.",
+        key="sidebar_custom_api_key_input",
+        label_visibility="collapsed",
+    )
+    if client_key_input != st.session_state.get("custom_api_key", ""):
+        st.session_state.custom_api_key = client_key_input.strip()
+        if client_key_input.strip():
+            st.toast("Client Gemini API key configured for session.")
+        st.rerun()
+
+    if not AppStateManager.get_api_key():
+        st.caption("Enter your Gemini API key above to enable AI features.")
+    else:
+        st.caption("Active client Gemini API key configured.")
 
     st.html('<div class="sh-nav-section-label">APPEARANCE</div>')
     theme_options = ["Light", "Dark"]
@@ -413,8 +563,9 @@ elif active_view == "Settings":
             key="input_session_api_key",
         )
         if custom_key != st.session_state.get("custom_api_key"):
-            st.session_state.custom_api_key = custom_key
-            st.toast("API key updated for current session.")
+            st.session_state.custom_api_key = custom_key.strip()
+            st.toast("Client Gemini API key updated for current session.")
+            st.rerun()
 
     with st.container(border=True):
         st.markdown("##### Workspace appearance")
