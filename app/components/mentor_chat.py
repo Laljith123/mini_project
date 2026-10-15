@@ -1,0 +1,931 @@
+"""
+Interactive AI Career Mentor Chat Component inspired by modern ChatGPT canvas.
+Features:
+- Minimalist hero: "What's on the agenda today?" with zero canned prompt clutter
+- Deep reasoning toggle: "Think" with Streamlit compact status ("Thought for N seconds")
+- ChatGPT-style SQL Database History (Today, Previous 7 Days, Older) with + New Chat
+- ChatGPT-style Candidate Memory (persisted in SQL database and automatically populated from resume)
+- Automatic resume data extraction + native file attachment in chat input
+- Backed by persistent SQL database (configured via Streamlit Secrets / st.secrets)
+"""
+
+import time
+import datetime
+import logging
+import re
+from typing import List, Dict, Any, Optional
+import streamlit as st
+
+from src.models.schemas import MentorResponse
+from src.mentor.rag_chain import MentorRAGChain
+from src.mentor.candidate_context import CandidateContextManager
+from src.human_loop.feedback import FeedbackManager
+from src.human_loop.audit import AuditLogger
+from src.human_loop.review import ProfileReviewManager
+from src.parsing.loader import load_document
+from src.parsing.resume_parser import parse_resume
+from src.models.enums import WorkflowState
+from app.state import AppStateManager
+from app.ui import render_badge
+from app.components.mentor_storage import MentorDatabaseManager
+from app.components.mentor_memory import MentorMemoryManager
+
+logger = logging.getLogger(__name__)
+
+
+def _group_sessions_by_date(sessions: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Group saved sessions into ChatGPT-style buckets: Today, Yesterday, Previous 7 days, Older."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    today_date = now.date()
+    yesterday_date = today_date - datetime.timedelta(days=1)
+    seven_days_ago = today_date - datetime.timedelta(days=7)
+
+    groups: Dict[str, List[Dict[str, Any]]] = {
+        "Today": [],
+        "Yesterday": [],
+        "Previous 7 days": [],
+        "Older": [],
+    }
+
+    for s in sessions:
+        up_str = s.get("updated_at")
+        if not up_str:
+            groups["Older"].append(s)
+            continue
+        try:
+            dt = datetime.datetime.fromisoformat(up_str.replace("Z", "+00:00"))
+            s_date = dt.date()
+            if s_date == today_date:
+                groups["Today"].append(s)
+            elif s_date == yesterday_date:
+                groups["Yesterday"].append(s)
+            elif s_date >= seven_days_ago:
+                groups["Previous 7 days"].append(s)
+            else:
+                groups["Older"].append(s)
+        except Exception:
+            groups["Older"].append(s)
+
+    return groups
+
+
+def _clean_citation_snippet(raw_text: str) -> str:
+    """Strip markdown headers and format cleanly for citation display."""
+    if not raw_text:
+        return ""
+    # Strip markdown header hashes (#, ##, ###)
+    cleaned = re.sub(r"^#+\s*", "", raw_text, flags=re.MULTILINE)
+    # Remove markdown bold/italic asterisks
+    cleaned = cleaned.replace("**", "").replace("__", "")
+    # Collapse multiple whitespaces and newlines
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:280]
+
+
+def _render_citations_widget(citations: list):
+    """Render grounded sources cleanly without empty-looking boxes or broken markdown headings."""
+    if not citations:
+        return
+
+    unique_titles = []
+    seen = set()
+    for c in citations:
+        t = (c.get("source_title") if isinstance(c, dict) else getattr(c, "source_title", None)) or "Career Guide"
+        if t not in seen:
+            seen.add(t)
+            unique_titles.append(t)
+
+    # Render clean inline badge chips
+    tags_html = "".join([
+        f'<span style="display: inline-flex; align-items: center; background: rgba(59, 130, 246, 0.12); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 9999px; padding: 2px 10px; font-size: 0.78rem; font-weight: 500; margin-right: 5px; margin-bottom: 4px;">{t}</span>'
+        for t in unique_titles
+    ])
+
+    st.markdown(
+        f"""
+        <div style="display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 8px; margin-bottom: 6px;">
+            <span style="font-size: 0.8rem; color: var(--sh-text-muted, #94a3b8); margin-right: 4px;">:material/menu_book: Grounded in:</span>
+            {tags_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander(f"Verified source excerpts ({len(citations)} chunks)", expanded=False):
+        for c in citations:
+            title = (c.get("source_title") if isinstance(c, dict) else getattr(c, "source_title", None)) or "Document"
+            chunk_idx = (c.get("chunk_index") if isinstance(c, dict) else getattr(c, "chunk_index", 0))
+            snippet = (c.get("snippet") if isinstance(c, dict) else getattr(c, "snippet", ""))
+            clean_snip = _clean_citation_snippet(snippet)
+
+            st.markdown(f"• **{title}** <span style='font-size: 0.76rem; color: var(--sh-text-muted);'>(Section {chunk_idx})</span>", unsafe_allow_html=True)
+            if clean_snip:
+                st.markdown(
+                    f"<div style='font-size: 0.83rem; color: var(--sh-text-muted); padding-left: 14px; margin-bottom: 8px; border-left: 2px solid rgba(255,255,255,0.12);'>“{clean_snip}…”</div>",
+                    unsafe_allow_html=True,
+                )
+
+
+def render_mentor_chat():
+    """Render the ChatGPT-inspired Career Mentor canvas."""
+
+    # 1. State initialization
+    if "mentor_session_id" not in st.session_state:
+        st.session_state.mentor_session_id = f"session_{int(time.time() * 1000)}"
+
+    if "mentor_chat_history" not in st.session_state:
+        # Load existing messages and memories for active session from database if available
+        loaded = MentorDatabaseManager.load_session(st.session_state.mentor_session_id)
+        st.session_state.mentor_chat_history = loaded
+        MentorMemoryManager.load_session_memories(st.session_state.mentor_session_id, messages=loaded)
+
+
+    if "mentor_think_mode" not in st.session_state:
+        st.session_state.mentor_think_mode = False
+
+    # Extract candidate context automatically from uploaded resume
+    candidate_ctx = CandidateContextManager.extract_from_session_state(st.session_state)
+    has_resume = candidate_ctx.get("has_resume", False)
+    cand_name = candidate_ctx.get("name", "Candidate")
+    cand_role = candidate_ctx.get("target_role", "Engineering / Tech")
+
+    # Initialize conversation memory strictly scoped to the active chat session
+    session_id = st.session_state.mentor_session_id
+    MentorMemoryManager.initialize_memories(candidate_ctx, session_id=session_id, seed_from_resume=False)
+    memories = MentorMemoryManager.get_memories(session_id=session_id)
+
+
+    # 2. Fetch saved sessions from database
+    saved_sessions = MentorDatabaseManager.list_sessions()
+
+    # 3. Top Action Toolbar (History + New Chat + Think + Memory + DB Status)
+    # Sticky container that remains pinned at the top when scrolling through chat history
+    st.markdown(
+        """
+        <style>
+        /* Sticky Mentor Top Action Toolbar (ChatGPT-style fixed navigation header) */
+        div[class*="st-key-mentor_sticky_toolbar"],
+        .st-key-mentor_sticky_toolbar {
+            position: -webkit-sticky !important;
+            position: sticky !important;
+            top: 2.875rem !important;
+            z-index: 990 !important;
+            background: var(--sh-bg, #0b0f19) !important;
+            padding-top: 6px !important;
+            padding-bottom: 10px !important;
+            margin-bottom: 12px !important;
+            border-bottom: 1px solid var(--sh-border-subtle, rgba(255, 255, 255, 0.08)) !important;
+            backdrop-filter: blur(16px) !important;
+            -webkit-backdrop-filter: blur(16px) !important;
+            box-shadow: 0 4px 16px -4px rgba(0, 0, 0, 0.25) !important;
+        }
+
+        /* Ensure parent container allows sticky positioning */
+        div:has(> div[class*="st-key-mentor_sticky_toolbar"]) {
+            position: -webkit-sticky !important;
+            position: sticky !important;
+            top: 2.875rem !important;
+            z-index: 990 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.container(key="mentor_sticky_toolbar"):
+        col_hist, col_new, col_think, col_mem = st.columns([1.2, 1, 1, 1.2])
+
+        with col_new:
+            if st.button("＋ New chat", key="btn_mentor_new_chat", type="secondary", width="stretch", help="Start a fresh conversation"):
+                new_id = f"session_{int(time.time() * 1000)}"
+                st.session_state.mentor_chat_history = []
+                st.session_state.mentor_session_id = new_id
+                MentorMemoryManager.reset_session_memories(new_id)
+                st.toast("Started fresh conversation for this chat.")
+                st.rerun()
+
+        with col_think:
+            think_active = st.session_state.get("mentor_think_mode", False)
+            think_type = "primary" if think_active else "secondary"
+            if st.button(":material/psychology: Think", key="btn_mentor_think_toggle", type=think_type, width="stretch", help="Toggle deep reasoning mode"):
+                st.session_state.mentor_think_mode = not think_active
+                st.toast(f"Deep reasoning mode: {'ON' if not think_active else 'OFF'}")
+                st.rerun()
+
+        with col_hist:
+            # History Popover (Grouped by Today, Yesterday, Previous 7 days, Older)
+            hist_label = f":material/history: History ({len(saved_sessions)})" if saved_sessions else ":material/history: History"
+            with st.popover(hist_label, width="stretch", help="Browse and restore saved chat history from database"):
+                # Inject Scoped CSS for Chat History Popover
+                st.markdown(
+                    """
+                    <style>
+                    /* Tighten vertical rhythm inside popover */
+                    [data-testid="stPopoverBody"] > div[data-testid="stVerticalBlock"] {
+                        gap: 6px !important;
+                    }
+
+                    /* Chat History Header */
+                    .mentor-hist-header {
+                        display: flex;
+                        flex-direction: column;
+                        gap: 1px;
+                        margin: 0;
+                        padding: 0;
+                    }
+                    .mentor-hist-title {
+                        font-size: 1.15rem !important;
+                        font-weight: 600 !important;
+                        color: #f8fafc !important;
+                        letter-spacing: -0.01em !important;
+                        line-height: 1.25 !important;
+                        margin: 0 !important;
+                        padding: 0 !important;
+                    }
+                    .mentor-hist-subtitle {
+                        font-size: 0.8rem !important;
+                        color: #94a3b8 !important;
+                        line-height: 1.2 !important;
+                        margin: 0 !important;
+                        padding: 0 !important;
+                    }
+
+                    /* Close Ghost Button (Top-Right, aligned with header top line) */
+                    [data-testid="stPopoverBody"] div[class*="st-key-btn_close_history_popover"] {
+                        display: flex !important;
+                        justify-content: flex-end !important;
+                        align-items: flex-start !important;
+                        width: 100% !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-btn_close_history_popover"] button {
+                        background: transparent !important;
+                        border: none !important;
+                        color: #64748b !important;
+                        height: 26px !important;
+                        min-height: 26px !important;
+                        max-height: 26px !important;
+                        width: 26px !important;
+                        min-width: 26px !important;
+                        max-width: 26px !important;
+                        padding: 0 !important;
+                        border-radius: 6px !important;
+                        box-shadow: none !important;
+                        transition: all 0.15s ease !important;
+                        display: flex !important;
+                        align-items: center !important;
+                        justify-content: center !important;
+                        margin-top: 1px !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-btn_close_history_popover"] button:hover {
+                        background: rgba(255, 255, 255, 0.08) !important;
+                        color: #f8fafc !important;
+                    }
+
+                    /* Compact Export Action */
+                    [data-testid="stPopoverBody"] div[class*="st-key-btn_export_active_chat"] {
+                        margin: 4px 0 6px 0 !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-btn_export_active_chat"] button {
+                        background: rgba(255, 255, 255, 0.035) !important;
+                        border: 1px solid rgba(255, 255, 255, 0.08) !important;
+                        color: #cbd5e1 !important;
+                        font-size: 0.8rem !important;
+                        font-weight: 500 !important;
+                        height: 32px !important;
+                        min-height: 32px !important;
+                        max-height: 32px !important;
+                        padding: 0 12px !important;
+                        border-radius: 7px !important;
+                        box-shadow: none !important;
+                        transition: all 0.15s ease !important;
+                        display: inline-flex !important;
+                        align-items: center !important;
+                        gap: 6px !important;
+                        width: auto !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-btn_export_active_chat"] button:hover {
+                        background: rgba(255, 255, 255, 0.07) !important;
+                        border-color: rgba(59, 130, 246, 0.35) !important;
+                        color: #ffffff !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-btn_export_active_chat"] button svg {
+                        width: 14px !important;
+                        height: 14px !important;
+                    }
+
+                    /* Date Grouping Labels (flush with left alignment) */
+                    [data-testid="stPopoverBody"] .mentor-hist-date-label {
+                        font-size: 0.72rem !important;
+                        font-weight: 600 !important;
+                        text-transform: uppercase !important;
+                        letter-spacing: 0.06em !important;
+                        color: #94a3b8 !important;
+                        margin: 10px 0 6px 0 !important;
+                        padding: 0 !important;
+                        user-select: none !important;
+                    }
+
+                    /* Scrollable List Area */
+                    [data-testid="stPopoverBody"] div[class*="st-key-mentor_history_scroll"] {
+                        max-height: 44vh !important;
+                        overflow-y: auto !important;
+                        overflow-x: hidden !important;
+                        padding-right: 2px !important;
+                        margin: 2px 0 !important;
+                        scrollbar-width: thin !important;
+                        scrollbar-color: rgba(255, 255, 255, 0.12) transparent !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-mentor_history_scroll"]::-webkit-scrollbar {
+                        width: 4px !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-mentor_history_scroll"]::-webkit-scrollbar-thumb {
+                        background: rgba(255, 255, 255, 0.12) !important;
+                        border-radius: 4px !important;
+                    }
+
+                    /* Conversation Row / Card */
+                    [data-testid="stPopoverBody"] div[class*="st-key-mentor_history_scroll"] div[data-testid="stHorizontalBlock"] {
+                        background: rgba(255, 255, 255, 0.025) !important;
+                        border: 1px solid rgba(255, 255, 255, 0.06) !important;
+                        border-radius: 10px !important;
+                        padding: 2px 6px 2px 10px !important;
+                        margin-bottom: 6px !important;
+                        align-items: center !important;
+                        transition: all 0.15s ease !important;
+                        height: 40px !important;
+                        min-height: 40px !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-mentor_history_scroll"] div[data-testid="stHorizontalBlock"]:hover {
+                        background: rgba(255, 255, 255, 0.055) !important;
+                        border-color: rgba(255, 255, 255, 0.12) !important;
+                    }
+
+                    /* Active Selected Conversation (Subtle blue accent, never saturated red) */
+                    [data-testid="stPopoverBody"] div[class*="st-key-mentor_history_scroll"] div[data-testid="stHorizontalBlock"]:has(button[kind="primary"]) {
+                        background: rgba(59, 130, 246, 0.09) !important;
+                        border: 1px solid rgba(59, 130, 246, 0.35) !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-mentor_history_scroll"] div[data-testid="stHorizontalBlock"]:has(button[kind="primary"]):hover {
+                        background: rgba(59, 130, 246, 0.15) !important;
+                        border-color: rgba(59, 130, 246, 0.48) !important;
+                    }
+
+                    /* Conversation Title Button */
+                    [data-testid="stPopoverBody"] div[class*="st-key-hist_load_"] {
+                        width: 100% !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-hist_load_"] button {
+                        background: transparent !important;
+                        border: none !important;
+                        padding: 0 !important;
+                        height: 36px !important;
+                        min-height: 36px !important;
+                        max-height: 36px !important;
+                        text-align: left !important;
+                        justify-content: flex-start !important;
+                        align-items: center !important;
+                        box-shadow: none !important;
+                        width: 100% !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-hist_load_"] button > div,
+                    [data-testid="stPopoverBody"] div[class*="st-key-hist_load_"] button > div > span,
+                    [data-testid="stPopoverBody"] div[class*="st-key-hist_load_"] button div[data-testid="stMarkdownContainer"] {
+                        justify-content: flex-start !important;
+                        text-align: left !important;
+                        align-items: center !important;
+                        width: 100% !important;
+                        display: flex !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-hist_load_"] button p {
+                        text-align: left !important;
+                        overflow: hidden !important;
+                        text-overflow: ellipsis !important;
+                        white-space: nowrap !important;
+                        color: #e2e8f0 !important;
+                        font-size: 0.86rem !important;
+                        font-weight: 450 !important;
+                        margin: 0 !important;
+                        line-height: 36px !important;
+                        width: 100% !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-hist_load_"] button[kind="primary"] p {
+                        color: #93c5fd !important;
+                        font-weight: 500 !important;
+                    }
+
+                    /* Direct button fallback for kind="primary" */
+                    [data-testid="stPopoverBody"] div[class*="st-key-hist_load_"] button[kind="primary"] {
+                        background: transparent !important;
+                        border: none !important;
+                        color: #93c5fd !important;
+                    }
+
+                    /* Delete Trash Button Column & Button */
+                    [data-testid="stPopoverBody"] div[class*="st-key-mentor_history_scroll"] div[data-testid="stHorizontalBlock"] > div:last-child {
+                        display: flex !important;
+                        justify-content: flex-end !important;
+                        align-items: center !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-hist_del_"] {
+                        display: flex !important;
+                        justify-content: flex-end !important;
+                        width: 100% !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-hist_del_"] button {
+                        background: transparent !important;
+                        border: none !important;
+                        color: #64748b !important;
+                        height: 30px !important;
+                        min-height: 30px !important;
+                        max-height: 30px !important;
+                        width: 30px !important;
+                        min-width: 30px !important;
+                        max-width: 30px !important;
+                        padding: 0 !important;
+                        border-radius: 6px !important;
+                        display: flex !important;
+                        align-items: center !important;
+                        justify-content: center !important;
+                        box-shadow: none !important;
+                        transition: all 0.15s ease !important;
+                        margin: 0 !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-hist_del_"] button:hover {
+                        background: rgba(248, 113, 113, 0.14) !important;
+                        color: #f87171 !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-hist_del_"] button span,
+                    [data-testid="stPopoverBody"] div[class*="st-key-hist_del_"] button svg {
+                        font-size: 1rem !important;
+                        color: inherit !important;
+                    }
+
+                    /* Clear History Action */
+                    [data-testid="stPopoverBody"] .mentor-hist-divider {
+                        border-top: 1px solid rgba(255, 255, 255, 0.07) !important;
+                        margin: 8px 0 4px 0 !important;
+                        width: 100% !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-btn_clear_all_chats"] {
+                        width: 100% !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-btn_clear_all_chats"] button {
+                        background: transparent !important;
+                        border: none !important;
+                        color: #94a3b8 !important;
+                        font-size: 0.8rem !important;
+                        font-weight: 500 !important;
+                        height: 28px !important;
+                        min-height: 28px !important;
+                        max-height: 28px !important;
+                        padding: 0 !important;
+                        border-radius: 6px !important;
+                        box-shadow: none !important;
+                        display: flex !important;
+                        align-items: center !important;
+                        justify-content: center !important;
+                        width: 100% !important;
+                        transition: all 0.15s ease !important;
+                    }
+                    [data-testid="stPopoverBody"] div[class*="st-key-btn_clear_all_chats"] button:hover {
+                        background: rgba(248, 113, 113, 0.08) !important;
+                        color: #f87171 !important;
+                    }
+
+                    /* Empty state */
+                    [data-testid="stPopoverBody"] .mentor-hist-empty {
+                        padding: 20px 12px;
+                        text-align: center;
+                        display: flex;
+                        flex-direction: column;
+                        gap: 4px;
+                    }
+                    [data-testid="stPopoverBody"] .mentor-hist-empty-title {
+                        color: #cbd5e1;
+                        font-size: 0.86rem;
+                        font-weight: 500;
+                    }
+                    [data-testid="stPopoverBody"] .mentor-hist-empty-desc {
+                        color: #64748b;
+                        font-size: 0.76rem;
+                    }
+                    </style>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                # Compact Header: Chat History + Your conversations on Left, Close on Right
+                col_head_text, col_head_close = st.columns([5.3, 0.7], vertical_alignment="top")
+                with col_head_text:
+                    st.markdown(
+                        """
+                        <div class="mentor-hist-header">
+                            <div class="mentor-hist-title">Chat History</div>
+                            <div class="mentor-hist-subtitle">Your conversations</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                with col_head_close:
+                    if st.button(":material/close:", key="btn_close_history_popover", help="Close history"):
+                        st.rerun()
+
+                # Compact Export Action directly below Header
+                if st.session_state.mentor_chat_history:
+                    export_json = MentorDatabaseManager.export_session_json(st.session_state.mentor_session_id)
+                    st.download_button(
+                        ":material/download: Export JSON",
+                        data=export_json,
+                        file_name=f"mentor_chat_{st.session_state.mentor_session_id}.json",
+                        mime="application/json",
+                        key="btn_export_active_chat",
+                        help="Export current conversation as JSON",
+                    )
+
+                # Scrollable History List
+                if not saved_sessions:
+                    st.markdown(
+                        """
+                        <div class="mentor-hist-empty">
+                            <span class="mentor-hist-empty-title">No conversations yet</span>
+                            <span class="mentor-hist-empty-desc">Your chat history will be automatically saved here.</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    grouped = _group_sessions_by_date(saved_sessions)
+                    with st.container(key="mentor_history_scroll"):
+                        for group_name, sess_list in grouped.items():
+                            if sess_list:
+                                st.markdown(f'<div class="mentor-hist-date-label">{group_name}</div>', unsafe_allow_html=True)
+                                for s in sess_list:
+                                    s_id = s.get("id")
+                                    s_title = s.get("title") or "Career Discussion"
+                                    short_title = (s_title[:28] + "...") if len(s_title) > 28 else s_title
+                                    is_curr = s_id == st.session_state.mentor_session_id
+
+                                    row_col1, row_col2 = st.columns([5.4, 0.6], gap="small", vertical_alignment="center")
+                                    with row_col1:
+                                        btn_type = "primary" if is_curr else "secondary"
+                                        if st.button(
+                                            short_title,
+                                            key=f"hist_load_{s_id}",
+                                            type=btn_type,
+                                            help=f"{s_title}\n({s.get('message_count', 0)} messages)",
+                                            width="stretch",
+                                        ):
+                                            msgs = MentorDatabaseManager.load_session(s_id)
+                                            st.session_state.mentor_session_id = s_id
+                                            st.session_state.mentor_chat_history = msgs
+                                            MentorMemoryManager.load_session_memories(s_id, messages=msgs)
+                                            st.toast(f"Loaded: '{short_title}'")
+                                            st.rerun()
+
+                                    with row_col2:
+                                        if st.button(":material/delete:", key=f"hist_del_{s_id}", help="Delete this chat from database"):
+                                            MentorDatabaseManager.delete_session(s_id)
+                                            if s_id == st.session_state.mentor_session_id:
+                                                st.session_state.mentor_chat_history = []
+                                                st.session_state.mentor_session_id = f"session_{int(time.time() * 1000)}"
+                                            st.toast("Conversation deleted.")
+                                            st.rerun()
+
+                    # Bottom Pinned Clear Action
+                    st.markdown('<div class="mentor-hist-divider"></div>', unsafe_allow_html=True)
+                    if st.button("Clear all chat history", key="btn_clear_all_chats", type="secondary", width="stretch", help="Permanently clear all saved conversations"):
+                        MentorDatabaseManager.clear_all_sessions()
+                        st.session_state.mentor_chat_history = []
+                        st.session_state.mentor_session_id = f"session_{int(time.time() * 1000)}"
+                        st.toast("Database chat history cleared.")
+                        st.rerun()
+
+        with col_mem:
+            # Memory Popover (Strictly isolated to this chat alone)
+            active_mems = MentorMemoryManager.get_memories(session_id)
+            mem_count_label = f":material/psychology: Memory ({len(active_mems)})" if active_mems else ":material/psychology: Memory"
+            with st.popover(mem_count_label, width="stretch", help="Candidate facts remembered for this conversation alone"):
+                st.markdown("##### Candidate Memory")
+                st.caption("Facts remembered during this chat alone.")
+
+                if not active_mems:
+                    st.info("No active memories for this chat. Facts discussed in your conversation will be remembered here.")
+                else:
+                    for idx, mem in enumerate(active_mems):
+                        m_c1, m_c2 = st.columns([5, 1])
+                        with m_c1:
+                            st.markdown(f"• {mem}")
+                        with m_c2:
+                            if st.button(":material/close:", key=f"del_mem_{idx}", help="Forget this memory fact"):
+                                MentorMemoryManager.remove_memory(idx, session_id=session_id)
+                                st.toast("Memory removed.")
+                                st.rerun()
+
+                st.divider()
+                new_mem_input = st.text_input(
+                    "Add custom memory note:",
+                    placeholder="e.g., Prefers remote roles, aiming for $220k+",
+                    key="input_new_memory_fact",
+                )
+                if st.button("Save to Memory", key="btn_save_custom_mem", width="stretch"):
+                    val_to_save = (st.session_state.get("input_new_memory_fact") or new_mem_input or "").strip()
+                    if val_to_save:
+                        MentorMemoryManager.add_memory(val_to_save, session_id=session_id)
+                        st.session_state["input_new_memory_fact"] = ""
+                        st.toast("Memory saved for this chat.")
+                        st.rerun()
+
+                if active_mems:
+                    st.markdown("<div style='margin-top: 0.5rem;'></div>", unsafe_allow_html=True)
+                    if st.button("Clear all memories", key="btn_clear_all_memories", type="secondary", width="stretch"):
+                        MentorMemoryManager.clear_memories(session_id=session_id)
+                        st.toast("Memories cleared for this chat.")
+                        st.rerun()
+
+
+
+    # 4. Minimalist ChatGPT Hero (When conversation is empty)
+    chat_history: List[Dict[str, Any]] = st.session_state.mentor_chat_history
+
+    if not chat_history:
+        resume_status_text = f"Connected: {candidate_ctx.get('name', 'Candidate')}" if has_resume else "Resume auto-linked via chat (+)"
+
+        st.html(f"""
+        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 280px; text-align: center; margin: 4vh 0 2vh 0;">
+            <h1 style="font-size: 2.35rem; font-weight: 600; color: var(--sh-text, #ffffff); letter-spacing: -0.025em; margin: 0 0 0.85rem 0;">
+                What's on the agenda today?
+            </h1>
+            <p style="color: var(--sh-text-muted, #94a3b8); font-size: 1.02rem; max-width: 540px; margin: 0 auto; line-height: 1.55;">
+                Ask anything freely about your career path, behavioral interviews, salary negotiation, or technical roadmaps.
+            </p>
+            <div style="display: flex; gap: 0.6rem; align-items: center; justify-content: center; margin-top: 1.4rem;">
+                <span style="display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 9999px; font-size: 0.78rem; font-weight: 500; background: var(--sh-surface, rgba(148,163,184,0.1)); border: 1px solid var(--sh-border, rgba(148,163,184,0.2)); color: var(--sh-text-muted, #94a3b8);">
+                    {resume_status_text}
+                </span>
+                <span style="display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 9999px; font-size: 0.78rem; font-weight: 500; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.25); color: #10b981;">
+                    ● Database Synced
+                </span>
+            </div>
+        </div>
+        """)
+
+    # Helper for ChatGPT-like live text streaming animation
+    def _stream_text_chunks(text: str):
+        words = text.split(" ")
+        for i, word in enumerate(words):
+            yield word + (" " if i < len(words) - 1 else "")
+            time.sleep(0.012)
+
+    # 5. Chat History Loop
+    for idx, msg in enumerate(chat_history):
+        role = msg.get("role", "user")
+        avatar_icon = ":material/account_circle:" if role == "user" else ":material/auto_awesome:"
+        with st.chat_message(role, avatar=avatar_icon):
+            thinking_text = msg.get("thinking")
+            display_content = msg.get("content", "")
+
+            # Self-healing: if an older message has raw <thinking> tags inside content, extract them cleanly
+            if role == "assistant" and "<thinking>" in display_content:
+                if not thinking_text:
+                    if "</thinking>" in display_content:
+                        m = re.search(r"<thinking>(.*?)</thinking>", display_content, flags=re.DOTALL)
+                        if m:
+                            thinking_text = m.group(1).strip()
+                        display_content = re.sub(r"<thinking>.*?</thinking>", "", display_content, flags=re.DOTALL).strip()
+                    else:
+                        parts = display_content.split("<thinking>", 1)
+                        thinking_text = parts[1].strip()
+                        display_content = parts[0].strip()
+
+                if thinking_text:
+                    thinking_text = re.sub(r"</?thinking>", "", thinking_text).strip()
+                display_content = re.sub(r"</?thinking>", "", display_content).strip()
+
+                if not display_content:
+                    display_content = "Hello! How can I assist you with your career planning, resume, or interview preparation today?"
+
+            # Render thinking block if present
+            if role == "assistant" and thinking_text:
+                duration = msg.get("thinking_duration")
+                duration_label = f"Thought for {duration}s" if duration else "Thought process"
+                with st.expander(f":material/psychology: {duration_label}", expanded=False):
+                    st.markdown(
+                        f"""
+                        <div style="font-size: 0.86rem; color: var(--sh-text-muted, #94a3b8); line-height: 1.55; white-space: pre-wrap; font-style: italic; border-left: 2px solid rgba(59, 130, 246, 0.45); padding: 4px 0 4px 12px; margin: 4px 0;">
+                        {thinking_text}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+            st.markdown(display_content)
+
+            # Citations block
+            if role == "assistant" and msg.get("citations"):
+                _render_citations_widget(msg["citations"])
+
+                # Feedback telemetry
+                f_col1, f_col2, _ = st.columns([1, 1, 4])
+                with f_col1:
+                    if st.button("Helpful", key=f"f_help_{idx}", help="Rate this response as helpful"):
+                        sources = [c.get("source_title", "") for c in msg.get("citations", [])]
+                        FeedbackManager.record_mentor_feedback(msg.get("question", ""), msg.get("content", ""), "helpful", sources)
+                        st.toast("Feedback recorded.")
+                with f_col2:
+                    if st.button("Not helpful", key=f"f_unhelp_{idx}", help="Rate this response as unhelpful"):
+                        sources = [c.get("source_title", "") for c in msg.get("citations", [])]
+                        FeedbackManager.record_mentor_feedback(msg.get("question", ""), msg.get("content", ""), "not_helpful", sources)
+                        st.toast("Feedback recorded.")
+
+    # 6. Floating Chat Input with Native Attachment (+) Support
+    prompt_submission = st.chat_input(
+        "Ask anything",
+        accept_file=True,
+        file_type=["pdf", "docx", "txt"],
+    )
+
+    if prompt_submission:
+        user_text = ""
+        attached_files = []
+
+        if hasattr(prompt_submission, "text"):
+            user_text = (prompt_submission.text or "").strip()
+            attached_files = getattr(prompt_submission, "files", []) or []
+        else:
+            user_text = str(prompt_submission).strip()
+
+        # Handle attached file if user uploaded via the + icon
+        if attached_files and len(attached_files) > 0:
+            first_file = attached_files[0]
+            try:
+                if hasattr(first_file, "getvalue"):
+                    file_bytes = first_file.getvalue()
+                else:
+                    if hasattr(first_file, "seek"):
+                        first_file.seek(0)
+                    file_bytes = first_file.read()
+                doc_info = load_document(file_bytes, filename=first_file.name)
+                st.session_state.uploaded_file_name = first_file.name
+                st.session_state.extracted_resume_text = doc_info["text"]
+
+                parsed_prof = parse_resume(doc_info["text"], api_key=AppStateManager.get_api_key())
+                new_container = ProfileReviewManager.initialize_review(parsed_prof)
+                st.session_state.human_profile_container = new_container
+                AppStateManager.set_workflow_state(WorkflowState.PROFILE_REVIEW)
+                AppStateManager.invalidate_downstream()
+
+                # Refresh candidate context
+                candidate_ctx = CandidateContextManager.extract_from_session_state(st.session_state)
+                cand_name = candidate_ctx.get("name", "Candidate")
+                cand_role = candidate_ctx.get("target_role", "Engineering / Tech")
+
+                AuditLogger.log_event("RESUME_ATTACHED_VIA_CHAT_INPUT", "USER", "SUCCESS", {"filename": first_file.name})
+                st.toast(f"Attached and parsed '{first_file.name}'!")
+            except Exception as ex:
+                st.warning(f"Could not parse attached document: {ex}")
+
+        # If user only uploaded a file without a prompt, formulate a natural onboarding question
+        if not user_text and attached_files:
+            user_text = f"I've attached my resume ({attached_files[0].name}). Please analyze my background, strengths, and target career trajectory."
+
+        if user_text:
+            session_id = st.session_state.mentor_session_id
+            now_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+            # Append user message to state and persist to database
+            st.session_state.mentor_chat_history.append({
+                "role": "user",
+                "content": user_text,
+                "timestamp": now_ts,
+            })
+            MentorDatabaseManager.save_message(
+                session_id=session_id,
+                role="user",
+                content=user_text,
+                candidate_name=cand_name,
+                target_role=cand_role,
+            )
+
+            with st.chat_message("user", avatar=":material/account_circle:"):
+                st.markdown(user_text)
+
+            # Generate AI response with typing indicator or thinking status
+            with st.chat_message("assistant", avatar=":material/auto_awesome:"):
+                rag_chain = MentorRAGChain(api_key=AppStateManager.get_api_key())
+                is_thinking_on = st.session_state.get("mentor_think_mode", False)
+
+                if is_thinking_on:
+                    with st.status(":material/psychology: Thinking...", expanded=True) as status_box:
+                        st.caption("Analyzing candidate context, intent, and career strategy...")
+                        t_gen_start = time.time()
+                        try:
+                            response = rag_chain.answer_question(
+                                question=user_text,
+                                chat_history=st.session_state.mentor_chat_history,
+                                candidate_context=candidate_ctx,
+                                candidate_memory=MentorMemoryManager.get_memories(session_id=session_id),
+                                enable_thinking=True,
+                            )
+                        except Exception as exc:
+                            logger.error(f"Mentor query failed: {exc}", exc_info=True)
+                            response = MentorResponse(
+                                question=user_text,
+                                answer="The career mentor is temporarily unavailable. Please verify your connection or Gemini API key and try again.",
+                                citations=[],
+                                is_grounded=False,
+                                refusal=True,
+                            )
+                        t_gen_elapsed = max(round(time.time() - t_gen_start, 1), 0.5)
+                        duration_val = getattr(response, "thinking_duration", None) or t_gen_elapsed
+                        status_box.update(
+                            label=f":material/psychology: Thought for {duration_val}s",
+                            state="complete",
+                            expanded=False,
+                        )
+                        resp_thinking = getattr(response, "thinking", None)
+                        if resp_thinking:
+                            st.markdown(
+                                f"""
+                                <div style="font-size: 0.86rem; color: var(--sh-text-muted, #94a3b8); line-height: 1.55; white-space: pre-wrap; font-style: italic; border-left: 2px solid rgba(59, 130, 246, 0.45); padding: 4px 0 4px 12px; margin: 4px 0;">
+                                {resp_thinking}
+                                </div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+                else:
+                    typing_placeholder = st.empty()
+                    typing_placeholder.html(
+                        '<div class="sh-typing-dots"><span></span><span></span><span></span></div>'
+                    )
+                    try:
+                        response = rag_chain.answer_question(
+                            question=user_text,
+                            chat_history=st.session_state.mentor_chat_history,
+                            candidate_context=candidate_ctx,
+                            candidate_memory=MentorMemoryManager.get_memories(session_id=session_id),
+                            enable_thinking=False,
+                        )
+                    except Exception as exc:
+                        logger.error(f"Mentor query failed: {exc}", exc_info=True)
+                        response = MentorResponse(
+                            question=user_text,
+                            answer="The career mentor is temporarily unavailable. Please verify your connection or Gemini API key and try again.",
+                            citations=[],
+                            is_grounded=False,
+                            refusal=True,
+                        )
+                    typing_placeholder.empty()
+
+                # Animated live text streaming of the final answer
+                resp_answer = getattr(response, "answer", "")
+                st.write_stream(_stream_text_chunks(resp_answer))
+
+                resp_citations = getattr(response, "citations", [])
+                if resp_citations:
+                    _render_citations_widget(resp_citations)
+
+                # Store assistant response in history and persist to database
+                citations_dict = [c.model_dump() for c in resp_citations]
+                resp_thinking = getattr(response, "thinking", None)
+                resp_duration = getattr(response, "thinking_duration", None)
+                st.session_state.mentor_chat_history.append({
+                    "role": "assistant",
+                    "content": resp_answer,
+                    "question": user_text,
+                    "thinking": resp_thinking,
+                    "thinking_duration": resp_duration,
+                    "citations": citations_dict,
+                    "timestamp": now_ts,
+                })
+
+                MentorDatabaseManager.save_message(
+                    session_id=session_id,
+                    role="assistant",
+                    content=resp_answer,
+                    thinking=resp_thinking,
+                    citations=citations_dict,
+                    candidate_name=cand_name,
+                    target_role=cand_role,
+                )
+
+                # Autonomous ChatGPT-style candidate memory extraction
+                added_mems = MentorMemoryManager.process_turn_autonomously(
+                    user_text=user_text,
+                    assistant_text=resp_answer,
+                    session_id=session_id,
+                    api_key=AppStateManager.get_api_key(),
+                )
+                if added_mems:
+                    st.toast(f"Remembered {len(added_mems)} new fact(s) in database.")
+
+                AuditLogger.log_event("MENTOR_QUERY_ANSWERED", "AI", "SUCCESS", {
+                    "question": user_text,
+                    "is_grounded": response.is_grounded,
+                    "refusal": response.refusal,
+                    "citations_count": len(response.citations),
+                    "session_id": session_id,
+                })
+                st.rerun()
+
+
+__all__ = ["render_mentor_chat"]

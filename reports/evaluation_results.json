@@ -1,0 +1,249 @@
+{
+  "timestamp": "2026-09-30T18:16:26.405292",
+  "retrieval_evaluation": {
+    "total_queries": 5,
+    "hits": 5,
+    "hit_rate": 1.0,
+    "details": [
+      {
+        "target_role": "Data Analyst",
+        "retrieved_titles": [
+          "Analytics Engineer Openings Based out in Bangalore",
+          "Lead Data Engineer - Commercial Analytics",
+          "Developer - SQL Bi/cosmos/sql Azure"
+        ],
+        "hit": true
+      },
+      {
+        "target_role": "Machine Learning Engineer",
+        "retrieved_titles": [
+          "Analytics Engineer Openings Based out in Bangalore",
+          "Machine Learning & NLP Expert -candidates From Premier Institutes Only",
+          "Full Stack Enginner"
+        ],
+        "hit": true
+      },
+      {
+        "target_role": "Senior Backend Developer",
+        "retrieved_titles": [
+          "Sr.java Developer(server side JAVA Programming)",
+          "Sr.java Developer",
+          "Senior Developer (retail POS Development)"
+        ],
+        "hit": true
+      },
+      {
+        "target_role": "Cybersecurity Analyst",
+        "retrieved_titles": [
+          "DPI Sr. System Analyst Position with a Telecom Product Based org.",
+          "Information Security Engineer - Contract to Hire - Bangalore",
+          "WLAN Device Driver Development Engineer - Linux"
+        ],
+        "hit": true
+      },
+      {
+        "target_role": "Analytics Engineer",
+        "retrieved_titles": [
+          "Analytics Engineer Openings Based out in Bangalore",
+          "Lead Data Engineer - Commercial Analytics",
+          "Solution BI Architect- Joinee"
+        ],
+        "hit": true
+      }
+    ]
+  },
+  "hallucination_evaluation": {
+    "total_unsupported_questions": 3,
+    "refusal_count": 3,
+    "refusal_rate": 1.0,
+    "details": [
+      {
+        "question": "What is the exact 2029 dental health insurance premium at Acme Widgets?",
+        "answer": "I don't know based on the available documents. \n\nMy focus is on helping you with career strategy, resume optimization, interview preparation, and tech",
+        "refused": true
+      },
+      {
+        "question": "Who was appointed VP of Engineering at Wayne Enterprises yesterday?",
+        "answer": "I don't know based on the available documents.",
+        "refused": true
+      },
+      {
+        "question": "What is the cafeteria lunch schedule at Stark Industries?",
+        "answer": "I don't know based on the available documents.",
+        "refused": true
+      }
+    ]
+  },
+  "prompt_comparison": {
+    "test_query": "How should I structure bullet points on my resume?",
+    "naive_prompt_characteristic": "Generic advice without document traceability, prone to fabricating metrics.",
+    "grounded_prompt_characteristic": "Restricted strictly to the XYZ formula from resume_writing_guide.txt with traceable citations.",
+    "grounded_answer_snippet": "The best way to structure high-impact resume bullet points is to use the Google **XYZ formula**: \n\n* **\"Accomplished [X], as measured by [Y], by doing [Z]\"**\n\nInstead of just listing what you did (like *\u201cWorked on backend APIs\u201d*), this framework forc...",
+    "citations_present": true,
+    "citation_sources": [
+      "Resume Writing Guide",
+      "Data Analyst Roadmap",
+      "Resume Writing Guide"
+    ]
+  },
+  "hitl_feedback_metrics": {
+    "total_job_feedback": 73,
+    "job_relevant_count": 73,
+    "job_irrelevant_count": 0,
+    "job_relevance_rate": 1.0,
+    "total_mentor_feedback": 73,
+    "mentor_helpful_count": 73,
+    "mentor_unhelpful_count": 0,
+    "mentor_helpfulness_rate": 1.0,
+    "total_cv_actions": 36,
+    "cv_accepted": 36,
+    "cv_edited": 0,
+    "cv_rejected": 0
+  },
+  "dataset_info": {
+    "mode": "raw_kaggle",
+    "path": "data/jobs/jobs_kaggle_naukri.csv",
+    "exists": true,
+    "job_count": 21739,
+    "source_label": "Kaggle Naukri Production Corpus (PromptCloudHQ/jobs-on-naukricom)",
+    "sources": [
+      "kaggle_naukri"
+    ],
+    "dataset_metadata": {
+      "dataset_name": "Kaggle Naukri Job Postings",
+      "source": "kaggle_naukri",
+      "source_dataset": "PromptCloudHQ/jobs-on-naukricom",
+      "raw_file": "data/raw/kaggle/jobs/naukri_com-job_sample.csv",
+      "raw_row_count": 22000,
+      "filtered_count": 4,
+      "duplicate_count": 257,
+      "normalized_row_count": 21739,
+      "columns_used": [
+        "job_id",
+        "title",
+        "company",
+        "location",
+        "skills",
+        "description",
+        "source",
+        "source_dataset",
+        "source_record_id",
+        "experience",
+        "education",
+        "industry"
+      ],
+      "output_file": "data/jobs/jobs_kaggle_naukri.csv",
+      "output_hash": "c12e3f6eee81f5e98371b487d031fdaa",
+      "max_rows_applied": null,
+      "prepared_at": "2026-09-30T15:25:29.591493+00:00",
+      "raw_audit": {
+        "total_rows": 22000,
+        "columns": [
+          "company",
+          "education",
+          "experience",
+          "industry",
+          "jobdescription",
+          "jobid",
+          "joblocation_address",
+          "jobtitle",
+          "numberofpositions",
+          "payrate",
+          "postdate",
+          "site_name",
+          "skills",
+          "uniq_id"
+        ],
+        "company": {
+          "null_count": 4,
+          "null_pct": 0.0,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "education": {
+          "null_count": 1996,
+          "null_pct": 9.1,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "experience": {
+          "null_count": 4,
+          "null_pct": 0.0,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "industry": {
+          "null_count": 5,
+          "null_pct": 0.0,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "jobdescription": {
+          "null_count": 4,
+          "null_pct": 0.0,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "jobid": {
+          "null_count": 0,
+          "null_pct": 0.0,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "joblocation_address": {
+          "null_count": 501,
+          "null_pct": 2.3,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "jobtitle": {
+          "null_count": 0,
+          "null_pct": 0.0,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "numberofpositions": {
+          "null_count": 17536,
+          "null_pct": 79.7,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "payrate": {
+          "null_count": 97,
+          "null_pct": 0.4,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "postdate": {
+          "null_count": 23,
+          "null_pct": 0.1,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "site_name": {
+          "null_count": 18013,
+          "null_pct": 81.9,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "skills": {
+          "null_count": 528,
+          "null_pct": 2.4,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "uniq_id": {
+          "null_count": 0,
+          "null_pct": 0.0,
+          "empty_count": 0,
+          "empty_pct": 0.0
+        },
+        "approximate_duplicates": 13530
+      }
+    },
+    "prepared_jobs_count": 21739,
+    "indexed_jobs_count": 500,
+    "index_status": "Partial Development Subset (500 / 21,739 indexed)",
+    "is_partial_index": true
+  }
+}
