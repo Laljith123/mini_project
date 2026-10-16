@@ -190,7 +190,7 @@ def render_jd_generator():
             help="High-level milestones, projects, or duties expected for this role.",
         )
 
-        generate_btn = st.button("Generate Tailored Job Description ✨", type="primary", use_container_width=True)
+        generate_btn = st.button("Generate Tailored Job Description ✨", type="primary", width="stretch")
 
     if generate_btn:
         if not job_title.strip():
@@ -311,14 +311,14 @@ def render_jd_generator():
                     data=active_jd.raw_markdown,
                     file_name=f"{active_jd.title.replace(' ', '_').lower()}_job_description.md",
                     mime="text/markdown",
-                    use_container_width=True,
+                    width="stretch",
                 )
             with act_col2:
-                if st.button("Copy / View Raw Markdown", use_container_width=True):
+                if st.button("Copy / View Raw Markdown", width="stretch"):
                     st.session_state["show_raw_jd_md"] = not st.session_state.get("show_raw_jd_md", False)
 
             with act_col3:
-                if st.button("Tailor Candidate Resume to this JD →", type="primary", use_container_width=True):
+                if st.button("Tailor Candidate Resume to this JD →", type="primary", width="stretch"):
                     # Set selected job or transition to Resume Studio
                     from src.models.schemas import JobPosting
                     synthetic_job = JobPosting(
